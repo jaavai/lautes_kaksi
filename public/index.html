@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Puheluavustaja</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background: #f5f5f5;
+      color: #111;
+    }
+
+    h1 {
+      margin-bottom: 10px;
+    }
+
+    .status {
+      margin-bottom: 20px;
+      color: #555;
+      font-size: 14px;
+    }
+
+    .controls {
+      margin-bottom: 16px;
+    }
+
+    button {
+      font-size: 18px;
+      padding: 10px 16px;
+      margin-right: 8px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      background: white;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .box {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .label {
+      font-size: 12px;
+      font-weight: bold;
+      color: #666;
+      margin-bottom: 8px;
+    }
+
+    .content {
+      white-space: pre-wrap;
+      font-size: 22px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <h1>Puheluavustaja</h1>
+  <div class="status" id="status">Yhdistetään...</div>
+
+  <div class="controls">
+    <button id="startMicBtn">Aloita mikrofonikuuntelu</button>
+    <button id="stopMicBtn" disabled>Lopeta</button>
+  </div>
+
+  <div class="box">
+    <div class="label">TRANSKRIPTIO</div>
+    <div class="content" id="transcript">Ei vielä tekstiä</div>
+  </div>
+
+  <div class="box">
+    <div class="label">AI-VIHJEET</div>
+    <div class="content" id="suggestions">Ei vielä vihjeitä</div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const suggestionsEl = document.getElementById("suggestions");
+    const startMicBtn = document.getElementById("startMicBtn");
+    const stopMicBtn = document.getElementById("stopMicBtn");
+
+    let uiWs = null;
+    let audioWs = null;
+    let reconnectTimer = null;
+
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let shouldKeepRecording = false;
+    let currentRecorderStopTimer = null;
+
+    const RECORDING_SLICE_MS = 10000;
+    const MIN_AUDIO_BLOB_BYTES = 5000;
+
+    function getWsProtocol() {
+      return location.protocol === "https:" ? "wss:" : "ws:";
+    }
+
+    function connectBrowserWs() {
+      const protocol = getWsProtocol();
+
+      uiWs = new WebSocket(`${protocol}//${location.host}/browser-ws`);
+
+      statusEl.textContent = "Yhdistetään serveriin...";
+
+      uiWs.onopen = () => {
+        statusEl.textContent = "Yhteys OK. Voit aloittaa mikrofonikuuntelun.";
+      };
+
+      uiWs.onclose = () => {
+        statusEl.textContent = "Yhteys poikki";
+
+        if (!reconnectTimer) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            connectBrowserWs();
+          }, 3000);
+        }
+      };
+
+      uiWs.onerror = () => {
+        statusEl.textContent = "WebSocket-virhe";
+      };
+
+      uiWs.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === "status") {
+            statusEl.textContent = msg.text || "";
+          }
+
+          if (msg.type === "transcript") {
+            transcriptEl.textContent = msg.text || "";
+          }
+
+          if (msg.type === "suggestions") {
+            suggestionsEl.textContent = msg.text || "";
+          }
+        } catch (err) {
+          console.error("Virhe viestin käsittelyssä:", err);
+        }
+      };
+    }
+
+    function getSupportedMimeType() {
+      if (typeof MediaRecorder === "undefined") {
+        return "";
+      }
+
+      if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+        return "audio/webm;codecs=opus";
+      }
+
+      if (MediaRecorder.isTypeSupported("audio/webm")) {
+        return "audio/webm";
+      }
+
+      return "";
+    }
+
+    function startRecorderCycle() {
+      if (!shouldKeepRecording) {
+        return;
+      }
+
+      if (!mediaStream || !audioWs || audioWs.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const mimeType = getSupportedMimeType();
+      const recorderOptions = mimeType ? { mimeType } : {};
+
+      let recorder;
+
+      try {
+        recorder = new MediaRecorder(mediaStream, recorderOptions);
+      } catch (err) {
+        console.error("MediaRecorderin luonti epäonnistui:", err);
+        statusEl.textContent = `Mikrofonin tallennusta ei voitu aloittaa: ${err.message}`;
+        stopMicrophone(true);
+        return;
+      }
+
+      const chunks = [];
+      mediaRecorder = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        if (currentRecorderStopTimer) {
+          clearTimeout(currentRecorderStopTimer);
+          currentRecorderStopTimer = null;
+        }
+
+        try {
+          if (
+            chunks.length > 0 &&
+            audioWs &&
+            audioWs.readyState === WebSocket.OPEN
+          ) {
+            const blobType = mimeType || "audio/webm";
+            const blob = new Blob(chunks, { type: blobType });
+
+            if (blob.size >= MIN_AUDIO_BLOB_BYTES) {
+              statusEl.textContent = "Lähetetään äänipätkä käsittelyyn...";
+
+              const buffer = await blob.arrayBuffer();
+              audioWs.send(buffer);
+            } else {
+              console.log("Ohitetaan liian pieni äänipätkä:", blob.size);
+              statusEl.textContent = "Hiljaisuus tai liian lyhyt äänipätkä ohitettu.";
+            }
+          }
+        } catch (err) {
+          console.error("Äänipätkän lähetys epäonnistui:", err);
+          statusEl.textContent = "Äänipätkän lähetys epäonnistui. Jatketaan kuuntelua.";
+        }
+
+        if (
+          shouldKeepRecording &&
+          mediaStream &&
+          audioWs &&
+          audioWs.readyState === WebSocket.OPEN
+        ) {
+          setTimeout(startRecorderCycle, 300);
+        }
+      };
+
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder-virhe:", event.error);
+        statusEl.textContent = "Mikrofonin tallennusvirhe. Yritetään jatkaa.";
+
+        try {
+          if (recorder.state === "recording") {
+            recorder.stop();
+          }
+        } catch (err) {
+          console.error("Recorderin pysäytys epäonnistui:", err);
+        }
+      };
+
+      try {
+        recorder.start();
+        statusEl.textContent = "Mikrofoni käynnissä. Kuunnellaan ääntä...";
+      } catch (err) {
+        console.error("Recorderin käynnistys epäonnistui:", err);
+        statusEl.textContent = `Mikrofonin tallennus ei käynnistynyt: ${err.message}`;
+        stopMicrophone(true);
+        return;
+      }
+
+      currentRecorderStopTimer = setTimeout(() => {
+        try {
+          if (recorder.state === "recording") {
+            recorder.stop();
+          }
+        } catch (err) {
+          console.error("Recorderin ajastettu pysäytys epäonnistui:", err);
+        }
+      }, RECORDING_SLICE_MS);
+    }
+
+    async function startMicrophone() {
+      try {
+        startMicBtn.disabled = true;
+        stopMicBtn.disabled = true;
+        statusEl.textContent = "Pyydetään mikrofonilupaa...";
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("Selain ei tue mikrofonin käyttöä.");
+        }
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+        const protocol = getWsProtocol();
+        audioWs = new WebSocket(`${protocol}//${location.host}/browser-audio`);
+
+        audioWs.binaryType = "arraybuffer";
+
+        audioWs.onopen = () => {
+          shouldKeepRecording = true;
+          statusEl.textContent = "Mikrofoni yhdistetty. Kuuntelu alkaa.";
+          stopMicBtn.disabled = false;
+          startRecorderCycle();
+        };
+
+        audioWs.onclose = () => {
+          statusEl.textContent = "Mikrofoniyhteys suljettu.";
+          stopMicrophone(false);
+        };
+
+        audioWs.onerror = () => {
+          statusEl.textContent = "Mikrofonin WebSocket-virhe.";
+          stopMicrophone(false);
+        };
+      } catch (err) {
+        console.error("Mikrofonin käynnistys epäonnistui:", err);
+        statusEl.textContent = `Mikrofonia ei voitu käynnistää: ${err.message}`;
+        stopMicrophone(true);
+      }
+    }
+
+    function stopMicrophone(closeSocket = true) {
+      shouldKeepRecording = false;
+
+      if (currentRecorderStopTimer) {
+        clearTimeout(currentRecorderStopTimer);
+        currentRecorderStopTimer = null;
+      }
+
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        try {
+          mediaRecorder.stop();
+        } catch (err) {
+          console.error("MediaRecorderin pysäytys epäonnistui:", err);
+        }
+      }
+
+      mediaRecorder = null;
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+      }
+
+      mediaStream = null;
+
+      if (
+        closeSocket &&
+        audioWs &&
+        (
+          audioWs.readyState === WebSocket.OPEN ||
+          audioWs.readyState === WebSocket.CONNECTING
+        )
+      ) {
+        audioWs.close();
+      }
+
+      audioWs = null;
+
+      startMicBtn.disabled = false;
+      stopMicBtn.disabled = true;
+    }
+
+    startMicBtn.addEventListener("click", startMicrophone);
+
+    stopMicBtn.addEventListener("click", () => {
+      stopMicrophone(true);
+      statusEl.textContent = "Mikrofonikuuntelu lopetettu.";
+    });
+
+    connectBrowserWs();
+  </script>
+</body>
+</html>
